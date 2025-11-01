@@ -1,0 +1,2 @@
+{"question": "Приложение вылетает при открытии фото на iOS 26.0.1", "conf": 0.5263711223853144, "version_hint": "26.0", "platform": null, "chunks": [{"ticket_id": 256920, "created_at": "2025-10-16T00:08:44Z"}, {"ticket_id": 256824, "created_at": "2025-10-13T19:01:18Z"}]}
+{"question": "Не удаётся экспортировать видео на Android, что делать?", "conf": 0.0, "version_hint": null, "platform": "android", "chunks": []}
