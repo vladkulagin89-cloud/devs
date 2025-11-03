@@ -1,4 +1,4 @@
-# rag_answer.py — RAG с форматированием ответа под стиль Vlad/Prisma
+# rag_answer.py — RAG c авто-языком, аккуратной версткой ответа и безопасными оговорками
 import os, math, json, re
 from typing import Optional, List, Tuple
 from datetime import datetime, timezone
@@ -11,9 +11,9 @@ from sentence_transformers import SentenceTransformer, util as sbert_util
 from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 
+# ---------- ENV ----------
 load_dotenv(Path(__file__).parent / ".env")
 
-# ---------- ENV ----------
 QDRANT_URL     = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLL           = os.getenv("QDRANT_COLLECTION", "zendesk_6m")
@@ -24,7 +24,7 @@ MODEL          = os.getenv("MODEL", "openai/gpt-oss-20b")
 EMB_MODEL_NAME = os.getenv("EMB_MODEL_NAME", "intfloat/multilingual-e5-small")
 RERANK_MODEL   = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-DATE_FROM      = os.getenv("DATE_FROM")
+DATE_FROM      = os.getenv("DATE_FROM")  # ISO: YYYY-MM-DD
 DATE_FROM_TS   = int(datetime.fromisoformat(DATE_FROM).replace(tzinfo=timezone.utc).timestamp()) if DATE_FROM else None
 
 TOP_K          = int(os.getenv("TOP_K", "12"))
@@ -37,20 +37,24 @@ MAX_OUTPUT_TOKENS        = int(os.getenv("MAX_OUTPUT_TOKENS", "256"))
 SNIPPET_CHARS_PER_CHUNK  = int(os.getenv("SNIPPET_CHARS_PER_CHUNK", "700"))
 
 ENABLE_RULE_TEMPLATES = os.getenv("ENABLE_RULE_TEMPLATES", "1") == "1"
+BRAND_DEFAULT  = os.getenv("BRAND_DEFAULT", "Lensa")  # можно переключать на Prisma при необходимости
 
 # ---------- Clients / Models ----------
 client = (qdrant_client.QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
           if QDRANT_API_KEY else qdrant_client.QdrantClient(QDRANT_URL))
 
-embedder    = SentenceTransformer(EMB_MODEL_NAME)
-sim_embedder= SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-cross       = CrossEncoder(RERANK_MODEL)
+embedder     = SentenceTransformer(EMB_MODEL_NAME)
+sim_embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+cross        = CrossEncoder(RERANK_MODEL)
 
 # ---------- Utilities ----------
 def iso_to_ts(iso_str: Optional[str]) -> Optional[int]:
-    if not iso_str: return None
-    try: return int(datetime.fromisoformat(iso_str.replace("Z","+00:00")).timestamp())
-    except Exception: return None
+    if not iso_str:
+        return None
+    try:
+        return int(datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
 
 def recency_decay(created_at_iso: str, lam: float, kind: Optional[str]) -> float:
     if kind == "sop":  # SOP не старим
@@ -62,7 +66,6 @@ def recency_decay(created_at_iso: str, lam: float, kind: Optional[str]) -> float
     days = (datetime.now(timezone.utc) - t).days
     return math.exp(-lam * max(0, days))
 
-# простая евристика платформы
 def extract_platform(text: str) -> Optional[str]:
     t = text.lower()
     if any(k in t for k in ["iphone","ipad","ios","ipados","apple"]): return "ios"
@@ -76,6 +79,25 @@ def extract_version_hint(text: str) -> Optional[str]:
 def embed_query(text: str):
     return embedder.encode([f"query: {text}"], normalize_embeddings=True)[0]
 
+def choose_language(user_text: str) -> str:
+    # супер-простая эвристика; LM Studio сам может перевести, но мы подсказываем
+    t = user_text.strip()
+    if re.search(r"[А-Яа-яЁё]", t):
+        return "ru"
+    if re.search(r"[¿¡]|[áéíóúñ]", t.lower()):
+        return "es"
+    if re.search(r"[àâçéèêëîïôùûüÿœ]", t.lower()):
+        return "fr"
+    if re.search(r"[äöüß]", t.lower()):
+        return "de"
+    return "en"
+
+def choose_brand(user_text: str, default_brand: str = BRAND_DEFAULT) -> str:
+    t = user_text.lower()
+    if "lensa" in t: return "Lensa"
+    if "prisma" in t: return "Prisma"
+    return default_brand
+
 # ---------- Retrieval ----------
 _TAG_CACHE = None
 def _collect_known_tags():
@@ -86,8 +108,8 @@ def _collect_known_tags():
         pts, _ = client.scroll(collection_name=COLL, limit=500, with_payload=True)
         s = set()
         for p in pts:
-            for t in (p.payload or {}).get("tags") or []:
-                s.add(str(t))
+            for tg in (p.payload or {}).get("tags") or []:
+                s.add(str(tg))
         _TAG_CACHE = s
     except Exception:
         _TAG_CACHE = set()
@@ -120,7 +142,8 @@ def sort_and_score(hits, query_text: str) -> List[Tuple[float, str, dict]]:
     return out
 
 def rerank_with_crossencoder(query, cand_list):
-    if not cand_list: return cand_list
+    if not cand_list:
+        return cand_list
     pairs = [(query, txt) for _, txt, _ in cand_list]
     ce = cross.predict(pairs)  # выше — лучше
     rescored = []
@@ -133,7 +156,7 @@ def build_context(chunks: List[Tuple[float,str,dict]]) -> str:
     blocks = []
     for i, (s, txt, p) in enumerate(chunks, 1):
         head = f"[{i}] kind:{p.get('kind')} title:{p.get('title')} ticket:{p.get('ticket_id')} created:{p.get('created_at')} score:{round(s,3)}"
-        blocks.append(head + "\n" + txt[:SNIPPET_CHARS_PER_CHUNK] + "\n")
+        blocks.append(head + "\n" + (txt or "")[:SNIPPET_CHARS_PER_CHUNK] + "\n")
     ctx = "\n---\n".join(blocks)
     approx = max(1, len(ctx)//4)
     if approx > MAX_CONTEXT_TOKENS:
@@ -141,7 +164,8 @@ def build_context(chunks: List[Tuple[float,str,dict]]) -> str:
     return ctx
 
 def confidence(chunks: List[Tuple[float,str,dict]]) -> float:
-    if not chunks: return 0.0
+    if not chunks:
+        return 0.0
     top3 = [s for s,_,_ in chunks[:3]]
     return sum(top3)/len(top3)
 
@@ -176,58 +200,71 @@ def retrieve_base(query_text: str, *, version_hint: Optional[str], platform: Opt
         cands = rerank_with_crossencoder(query_text, cands)
     return cands
 
-# ---------- Answer formatting ----------
-def make_assistant_prefill(platform: Optional[str]) -> str:
-    # «праймим» стиль ответа — приветствие, структура, ветвление по магазину
-    play_steps = (
-        "1. Open Google Play.\n"
-        "2. Tap profile icon → Payments & subscriptions.\n"
-        "3. Subscriptions → select Prisma → Cancel and Request refund."
-    )
-    apple_steps = (
-        "1. Go to reportaproblem.apple.com\n"
-        "2. Sign in with Apple ID.\n"
-        "3. Find the Prisma payment → Request a refund → follow the steps."
-    )
-    web_steps = (
-        "Please send the email used at purchase and the purchase receipt. "
-        "I'll check it and help with the refund from our side."
-    )
+# ---------- Assistant prefill & formatting ----------
+def choose_ph(lang: str, brand: str):
+    # короткие фразы под приветствие/интро
+    if lang == "ru":
+        return {
+            "greet": "Здравствуйте",
+            "intro": f"Меня зовут Влад, я из команды поддержки {brand}. Спасибо за обращение."
+        }
+    if lang == "es":
+        return {
+            "greet": "Hola",
+            "intro": f"Me llamo Vlad, del equipo de soporte de {brand}. Gracias por escribirnos."
+        }
+    if lang == "fr":
+        return {
+            "greet": "Bonjour",
+            "intro": f"Je m’appelle Vlad, de l’équipe d’assistance {brand}. Merci pour votre message."
+        }
+    if lang == "de":
+        return {
+            "greet": "Hallo",
+            "intro": f"Ich bin Vlad vom {brand}-Supportteam. Danke für Ihre Nachricht."
+        }
+    # default EN
+    return {
+        "greet": "Hello",
+        "intro": f"My name is Vlad, I’m from the {brand} support team. Thank you for reaching out."
+    }
 
-    # если угадываем платформу — подсвечиваем соответствующую ветку
-    target = ""
-    if platform == "android":
-        target = f"If purchased through Google Play:\n{play_steps}\n\n"
-    elif platform == "ios":
-        target = f"If purchased through Apple App Store:\n{apple_steps}\n\n"
-    else:
-        target = ""
-
+def make_assistant_prefill(lang: str, brand: str) -> str:
+    ph = choose_ph(lang, brand)
+    # просим реальные переносы строк (не '\n')
     return (
-        "You are Vlad from the Prisma support team. Always reply in English, "
-        "polite and structured, with this format:\n\n"
-        "Hello <name>,\n\n"
-        "My name is Vlad, I’m from the Prisma support team. Thank you for reaching out.\n\n"
-        "The refund process depends on where the subscription was purchased. "
-        "Provide clear steps for Apple App Store and Google Play; if purchased on our website, "
-        "ask for the email used at purchase and the receipt.\n\n"
-        + target +
-        "If purchased on our website:\n" + web_steps + "\n\n"
-        "Finish with: 'Let me know once you try the steps or if you’re not sure which platform was used. I’ll help further.'\n\n"
-        "Sign with: 'Best regards,\nVlad'"
+        f"You are Vlad from the {brand} support team. Answer in {lang.upper()}.\n"
+        f"Start exactly like this with real line breaks:\n"
+        f"{ph['greet']},\n\n{ph['intro']}\n\n"
+        "Use only the facts from the RAG context for product policies. "
+        "Do NOT mention billing/payments/refunds/cancellation unless the user asked. "
+        "If context is insufficient, ask for minimal missing info in one short paragraph. "
+        "Use real line breaks in your reply, never print literal \\n. Keep it concise and professional."
     )
 
-def ask_llm(user_text: str, context: str, assistant_prefill: Optional[str]=None) -> str:
+def _normalize_newlines(text: str) -> str:
+    # заменяем литералы \n на настоящие переносы
+    text = text.replace("\\n", "\n")
+    # убираем пробелы в конце строк и тройные пустые строки
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    text = "\n".join(lines)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip()
+
+def ask_llm(user_text: str, context: str, lang: str, brand: str) -> str:
     system = (
-        "You are a level-headed L2/L3 support assistant. Use only the facts from the RAG context when giving product-specific details. "
-        "If the context is insufficient for a definitive answer, provide the best general guidance and clearly state what extra info is needed. "
-        "Keep responses concise, structured, and professional."
+        f"You are an L2/L3 support assistant for {brand}. Answer in {lang.upper()} and ONLY use product-specific facts from the RAG context. "
+        "Do NOT mention billing, payments, refunds or subscriptions unless the user message explicitly contains such terms. "
+        "Use real line breaks, never print literal \\n. "
+        "Keep responses concise, structured, and professional. If context is insufficient, ask for minimal missing info. Do not hallucinate."
     )
-    messages = [{"role": "system", "content": system}]
-    if assistant_prefill:
-        messages.append({"role": "assistant", "content": assistant_prefill})
-    messages.append({"role": "user", "content": f"User message:\n{user_text}\n\nRAG context:\n{context}"})
-
+    prefill = make_assistant_prefill(lang, brand)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "assistant", "content": prefill},
+        {"role": "user", "content": ("User message:\n" + user_text + ("\n\nRAG context:\n" + context if context else ""))}
+    ]
     payload = {
         "model": MODEL,
         "messages": messages,
@@ -239,39 +276,41 @@ def ask_llm(user_text: str, context: str, assistant_prefill: Optional[str]=None)
         data = r.json()
         if r.status_code != 200:
             return f"LM Studio http {r.status_code}: {data}"
-        return data["choices"][0]["message"]["content"]
+        raw = data["choices"][0]["message"]["content"]
+        return _normalize_newlines(raw)
     except Exception as e:
         return f"LM Studio недоступен: {e}"
 
 # ---------- Public API ----------
 def route_ticket(ticket_text: str, *, user_prompt: Optional[str]=None, ticket_id: Optional[int]=None) -> str:
+    # автоязык и бренд
+    lang   = choose_language(ticket_text)
+    brand  = choose_brand(ticket_text, BRAND_DEFAULT)
+    # подсказки из текста
     version_hint = extract_version_hint(ticket_text)
     platform     = extract_platform(ticket_text)
 
-    # RAG candidates
+    # RAG
     chunks = retrieve_base(ticket_text, version_hint=version_hint, platform=platform, limit=TOP_K)
     conf = confidence(chunks) if chunks else 0.0
     top_score = chunks[0][0] if chunks else 0.0
 
-    # если совсем пусто — всё равно попробуем выдать полезный ответ по шаблону
-    ctx = build_context(chunks) if chunks else "No exact matches. Provide general policy steps."
+    # если совсем пусто — всё равно пробуем дать нейтральный ответ (без конкретики)
+    ctx = build_context(chunks) if chunks else "No exact matches. Provide general guidance and ask for clarifications."
 
-    # мягкий порог — позволяем отвечать даже при низком conf, но без «уверенных» утверждений
-    local_thr = CONF_THRESHOLD - (0.1 if (chunks and chunks[0][2].get("kind") == "sop") else 0.0)
-    assistant_prefill = make_assistant_prefill(platform)
+    prompt = user_prompt or "Compose a complete reply in the described style."
+    answer = ask_llm(prompt + "\n\nUser ticket:\n" + ticket_text, ctx, lang=lang, brand=brand)
 
-    prompt = user_prompt or "Compose the full reply in Vlad/Prisma format described above."
-    answer = ask_llm(prompt + "\n\nUser ticket:\n" + ticket_text, ctx, assistant_prefill=assistant_prefill)
-
-    suffix = f"\n\n(confidence={conf:.2f}, top_score={top_score:.2f})"
-    return answer + suffix
+    return answer + f"\n\n(confidence={conf:.2f}, top_score={top_score:.2f})"
 
 def route_answer(question: str, *, version_hint: Optional[str]=None, platform: Optional[str]=None) -> str:
-    # общий вопрос (не конкретный тикет)
+    lang  = choose_language(question)
+    brand = choose_brand(question, BRAND_DEFAULT)
+
     chunks = retrieve_base(question, version_hint=version_hint, platform=platform, limit=TOP_K)
     ctx = build_context(chunks) if chunks else "No exact matches."
-    assistant_prefill = None  # тут не навязываем шаблон ответа
-    answer = ask_llm(question, ctx, assistant_prefill=assistant_prefill)
+    answer = ask_llm(question, ctx, lang=lang, brand=brand)
+
     conf = confidence(chunks) if chunks else 0.0
     top_score = chunks[0][0] if chunks else 0.0
     return answer + f"\n\n(confidence={conf:.2f}, top_score={top_score:.2f})"
