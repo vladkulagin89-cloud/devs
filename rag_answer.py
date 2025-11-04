@@ -1,6 +1,7 @@
-# rag_answer.py — RAG c авто-языком, аккуратной версткой ответа и безопасными оговорками
-import os, math, json, re
-from typing import Optional, List, Tuple
+# rag_answer.py — RAG + детекция языка + overrides + мета
+
+import os, math, re
+from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,20 +12,33 @@ from sentence_transformers import SentenceTransformer, util as sbert_util
 from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 
-# ---------- ENV ----------
+from log_utils import (
+    build_rag_chunk_summaries,
+    log_record,
+    log_review,
+    log_approval,
+    ensure_logs_dir,
+    load_calibration_threshold,
+    now_iso,
+)
+from feedback_store import load_overrides, match_override
+
 load_dotenv(Path(__file__).parent / ".env")
 
 QDRANT_URL     = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLL           = os.getenv("QDRANT_COLLECTION", "zendesk_6m")
 
-LMSTUDIO_BASE  = os.getenv("LMSTUDIO_BASE", "http://localhost:1234/v1")
+LMSTUDIO_BASE  = os.getenv("LMSTUDIO_BASE", "http://localhost:1234/v1").rstrip("/")
+if not LMSTUDIO_BASE.endswith("/v1"):
+    LMSTUDIO_BASE = LMSTUDIO_BASE + "/v1"
+
 MODEL          = os.getenv("MODEL", "openai/gpt-oss-20b")
 
 EMB_MODEL_NAME = os.getenv("EMB_MODEL_NAME", "intfloat/multilingual-e5-small")
 RERANK_MODEL   = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-DATE_FROM      = os.getenv("DATE_FROM")  # ISO: YYYY-MM-DD
+DATE_FROM      = os.getenv("DATE_FROM")
 DATE_FROM_TS   = int(datetime.fromisoformat(DATE_FROM).replace(tzinfo=timezone.utc).timestamp()) if DATE_FROM else None
 
 TOP_K          = int(os.getenv("TOP_K", "12"))
@@ -37,9 +51,11 @@ MAX_OUTPUT_TOKENS        = int(os.getenv("MAX_OUTPUT_TOKENS", "256"))
 SNIPPET_CHARS_PER_CHUNK  = int(os.getenv("SNIPPET_CHARS_PER_CHUNK", "700"))
 
 ENABLE_RULE_TEMPLATES = os.getenv("ENABLE_RULE_TEMPLATES", "1") == "1"
-BRAND_DEFAULT  = os.getenv("BRAND_DEFAULT", "Lensa")  # можно переключать на Prisma при необходимости
+BRAND_NAME = os.getenv("BRAND_NAME", "Lensa")
+AGENT_ID   = os.getenv("AGENT_ID", "vlad")
 
-# ---------- Clients / Models ----------
+CALIB_THRESHOLD = load_calibration_threshold(default=CONF_THRESHOLD)
+
 client = (qdrant_client.QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
           if QDRANT_API_KEY else qdrant_client.QdrantClient(QDRANT_URL))
 
@@ -47,17 +63,28 @@ embedder     = SentenceTransformer(EMB_MODEL_NAME)
 sim_embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 cross        = CrossEncoder(RERANK_MODEL)
 
-# ---------- Utilities ----------
+def detect_language(text: str) -> str:
+    t = text.lower()
+    lang_hints = {
+        "ru": ["привет","здравствуйте","подписк","возврат","ошибк","устройство","версия","как"],
+        "es": ["hola","gracias","reembolso","suscrip","ayuda","por"],
+        "fr": ["bonjour","merci","rembourse","abonn","pouvez","comment"],
+        "de": ["hallo","danke","erstatt","abonnement","bitte","wie"],
+        "pt": ["olá","obrigado","assinatur","reembolso","por favor"],
+    }
+    for lang, keys in lang_hints.items():
+        if any(k in t for k in keys):
+            return lang
+    if re.search(r"[а-яё]", t): return "ru"
+    return "en"
+
 def iso_to_ts(iso_str: Optional[str]) -> Optional[int]:
-    if not iso_str:
-        return None
-    try:
-        return int(datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp())
-    except Exception:
-        return None
+    if not iso_str: return None
+    try: return int(datetime.fromisoformat(iso_str.replace("Z","+00:00")).timestamp())
+    except Exception: return None
 
 def recency_decay(created_at_iso: str, lam: float, kind: Optional[str]) -> float:
-    if kind == "sop":  # SOP не старим
+    if kind == "sop":
         return 1.0
     try:
         t = datetime.fromisoformat((created_at_iso or "").replace("Z", "+00:00"))
@@ -79,26 +106,6 @@ def extract_version_hint(text: str) -> Optional[str]:
 def embed_query(text: str):
     return embedder.encode([f"query: {text}"], normalize_embeddings=True)[0]
 
-def choose_language(user_text: str) -> str:
-    # супер-простая эвристика; LM Studio сам может перевести, но мы подсказываем
-    t = user_text.strip()
-    if re.search(r"[А-Яа-яЁё]", t):
-        return "ru"
-    if re.search(r"[¿¡]|[áéíóúñ]", t.lower()):
-        return "es"
-    if re.search(r"[àâçéèêëîïôùûüÿœ]", t.lower()):
-        return "fr"
-    if re.search(r"[äöüß]", t.lower()):
-        return "de"
-    return "en"
-
-def choose_brand(user_text: str, default_brand: str = BRAND_DEFAULT) -> str:
-    t = user_text.lower()
-    if "lensa" in t: return "Lensa"
-    if "prisma" in t: return "Prisma"
-    return default_brand
-
-# ---------- Retrieval ----------
 _TAG_CACHE = None
 def _collect_known_tags():
     global _TAG_CACHE
@@ -108,8 +115,8 @@ def _collect_known_tags():
         pts, _ = client.scroll(collection_name=COLL, limit=500, with_payload=True)
         s = set()
         for p in pts:
-            for tg in (p.payload or {}).get("tags") or []:
-                s.add(str(tg))
+            for t in (p.payload or {}).get("tags") or []:
+                s.add(str(t))
         _TAG_CACHE = s
     except Exception:
         _TAG_CACHE = set()
@@ -142,10 +149,9 @@ def sort_and_score(hits, query_text: str) -> List[Tuple[float, str, dict]]:
     return out
 
 def rerank_with_crossencoder(query, cand_list):
-    if not cand_list:
-        return cand_list
+    if not cand_list: return cand_list
     pairs = [(query, txt) for _, txt, _ in cand_list]
-    ce = cross.predict(pairs)  # выше — лучше
+    ce = cross.predict(pairs)
     rescored = []
     for (base_s, txt, p), ce_s in zip(cand_list, ce):
         rescored.append((0.5*base_s + 0.5*float(ce_s), txt, p))
@@ -156,7 +162,7 @@ def build_context(chunks: List[Tuple[float,str,dict]]) -> str:
     blocks = []
     for i, (s, txt, p) in enumerate(chunks, 1):
         head = f"[{i}] kind:{p.get('kind')} title:{p.get('title')} ticket:{p.get('ticket_id')} created:{p.get('created_at')} score:{round(s,3)}"
-        blocks.append(head + "\n" + (txt or "")[:SNIPPET_CHARS_PER_CHUNK] + "\n")
+        blocks.append(head + "\n" + txt[:SNIPPET_CHARS_PER_CHUNK] + "\n")
     ctx = "\n---\n".join(blocks)
     approx = max(1, len(ctx)//4)
     if approx > MAX_CONTEXT_TOKENS:
@@ -164,8 +170,7 @@ def build_context(chunks: List[Tuple[float,str,dict]]) -> str:
     return ctx
 
 def confidence(chunks: List[Tuple[float,str,dict]]) -> float:
-    if not chunks:
-        return 0.0
+    if not chunks: return 0.0
     top3 = [s for s,_,_ in chunks[:3]]
     return sum(top3)/len(top3)
 
@@ -185,7 +190,6 @@ def retrieve_base(query_text: str, *, version_hint: Optional[str], platform: Opt
     if hits is None:
         hits = client.search(collection_name=COLL, query_vector=vec, limit=limit, with_payload=True, query_filter=qfilter)
 
-    # необязательный префильтр по версии
     if version_hint:
         filtered = []
         for h in hits:
@@ -200,117 +204,109 @@ def retrieve_base(query_text: str, *, version_hint: Optional[str], platform: Opt
         cands = rerank_with_crossencoder(query_text, cands)
     return cands
 
-# ---------- Assistant prefill & formatting ----------
-def choose_ph(lang: str, brand: str):
-    # короткие фразы под приветствие/интро
-    if lang == "ru":
-        return {
-            "greet": "Здравствуйте",
-            "intro": f"Меня зовут Влад, я из команды поддержки {brand}. Спасибо за обращение."
-        }
-    if lang == "es":
-        return {
-            "greet": "Hola",
-            "intro": f"Me llamo Vlad, del equipo de soporte de {brand}. Gracias por escribirnos."
-        }
-    if lang == "fr":
-        return {
-            "greet": "Bonjour",
-            "intro": f"Je m’appelle Vlad, de l’équipe d’assistance {brand}. Merci pour votre message."
-        }
-    if lang == "de":
-        return {
-            "greet": "Hallo",
-            "intro": f"Ich bin Vlad vom {brand}-Supportteam. Danke für Ihre Nachricht."
-        }
-    # default EN
-    return {
-        "greet": "Hello",
-        "intro": f"My name is Vlad, I’m from the {brand} support team. Thank you for reaching out."
-    }
+def ask_llm(user_text: str, context: str, assistant_prefill: Optional[str]=None, user_lang: Optional[str]=None) -> str:
+    brand = BRAND_NAME
+    lang_clause = f"Respond in {user_lang or 'the same'} language as the user's message."
 
-def make_assistant_prefill(lang: str, brand: str) -> str:
-    ph = choose_ph(lang, brand)
-    # просим реальные переносы строк (не '\n')
-    return (
-        f"You are Vlad from the {brand} support team. Answer in {lang.upper()}.\n"
-        f"Start exactly like this with real line breaks:\n"
-        f"{ph['greet']},\n\n{ph['intro']}\n\n"
-        "Use only the facts from the RAG context for product policies. "
-        "Do NOT mention billing/payments/refunds/cancellation unless the user asked. "
-        "If context is insufficient, ask for minimal missing info in one short paragraph. "
-        "Use real line breaks in your reply, never print literal \\n. Keep it concise and professional."
-    )
-
-def _normalize_newlines(text: str) -> str:
-    # заменяем литералы \n на настоящие переносы
-    text = text.replace("\\n", "\n")
-    # убираем пробелы в конце строк и тройные пустые строки
-    lines = [ln.rstrip() for ln in text.split("\n")]
-    text = "\n".join(lines)
-    while "\n\n\n" in text:
-        text = text.replace("\n\n\n", "\n\n")
-    return text.strip()
-
-def ask_llm(user_text: str, context: str, lang: str, brand: str) -> str:
     system = (
-        f"You are an L2/L3 support assistant for {brand}. Answer in {lang.upper()} and ONLY use product-specific facts from the RAG context. "
-        "Do NOT mention billing, payments, refunds or subscriptions unless the user message explicitly contains such terms. "
-        "Use real line breaks, never print literal \\n. "
-        "Keep responses concise, structured, and professional. If context is insufficient, ask for minimal missing info. Do not hallucinate."
+        "You are a calm L2/L3 support assistant. "
+        "Use ONLY the facts from the RAG context for product-specific details. "
+        "If context is insufficient, ask exactly for the missing bits. "
+        f"- Brand: {brand}\n"
+        f"- {lang_clause}\n"
+        "- Format: plain text; short paragraphs; bullet lists only if helpful. "
+        "NO tables, NO HTML, NO code blocks. "
+        "Keep it concise and finish the thought (no truncation)."
     )
-    prefill = make_assistant_prefill(lang, brand)
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "assistant", "content": prefill},
-        {"role": "user", "content": ("User message:\n" + user_text + ("\n\nRAG context:\n" + context if context else ""))}
-    ]
+
+    approx_limit_chars = max(512, int(MAX_CONTEXT_TOKENS) * 4)
+    safe_context = context[:approx_limit_chars]
+
+    messages = [{"role": "system", "content": system}]
+    if assistant_prefill:
+        messages.append({"role": "assistant", "content": assistant_prefill})
+
+    payload_user = "User message:\n" + user_text.strip() + "\n\nRAG context:\n" + safe_context.strip()
+    messages.append({"role": "user", "content": payload_user})
+
     payload = {
         "model": MODEL,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": MAX_OUTPUT_TOKENS
+        "max_tokens": int(MAX_OUTPUT_TOKENS),
+        "frequency_penalty": 0.2,
+        "presence_penalty": 0.0,
     }
+
     try:
         r = requests.post(f"{LMSTUDIO_BASE}/chat/completions", json=payload, timeout=60)
         data = r.json()
         if r.status_code != 200:
             return f"LM Studio http {r.status_code}: {data}"
-        raw = data["choices"][0]["message"]["content"]
-        return _normalize_newlines(raw)
+        text = data["choices"][0]["message"]["content"]
+        t = (text or "").strip()
+        if t and t[-1] not in ".!?…":
+            t += "."
+        return t
     except Exception as e:
         return f"LM Studio недоступен: {e}"
 
-# ---------- Public API ----------
-def route_ticket(ticket_text: str, *, user_prompt: Optional[str]=None, ticket_id: Optional[int]=None) -> str:
-    # автоязык и бренд
-    lang   = choose_language(ticket_text)
-    brand  = choose_brand(ticket_text, BRAND_DEFAULT)
-    # подсказки из текста
+def make_assistant_prefill(platform: Optional[str], language: str = "en") -> str:
+    # минимальный стиль: приветствие, представление, структура
+    # (без жёстких шаблонов по возвратам — это общий префилл)
+    if language.startswith("ru"):
+        intro = (
+            "Здравствуйте,\n\n"
+            "Меня зовут Влад, я из команды поддержки Lensa. "
+            "Спасибо за обращение.\n\n"
+            "Ниже приведены шаги/рекомендации. Если чего-то не хватает, уточню детали."
+        )
+    else:
+        intro = (
+            "Hello,\n\n"
+            "My name is Vlad, I’m from the Lensa support team. "
+            "Thank you for reaching out.\n\n"
+            "Below are the steps/recommendations. If something is missing, I’ll ask a quick follow-up."
+        )
+    # лёгкая подсветка платформы
+    plat_hint = ""
+    if platform == "ios":
+        plat_hint = "Platform: iOS.\n\n"
+    elif platform == "android":
+        plat_hint = "Platform: Android.\n\n"
+
+    return intro + ("\n" + plat_hint if plat_hint else "\n")
+
+def route_ticket_meta(ticket_text: str, *, user_prompt: Optional[str]=None, ticket_id: Optional[str]=None):
+    # ... до этого места оставь как есть (детект языка/платформы, retrieve_base и т.д.) ...
     version_hint = extract_version_hint(ticket_text)
     platform     = extract_platform(ticket_text)
+    language     = detect_language(ticket_text)
 
-    # RAG
     chunks = retrieve_base(ticket_text, version_hint=version_hint, platform=platform, limit=TOP_K)
     conf = confidence(chunks) if chunks else 0.0
     top_score = chunks[0][0] if chunks else 0.0
+    ctx = build_context(chunks) if chunks else "No exact matches. Provide general troubleshooting and ask clarifying questions."
 
-    # если совсем пусто — всё равно пробуем дать нейтральный ответ (без конкретики)
-    ctx = build_context(chunks) if chunks else "No exact matches. Provide general guidance and ask for clarifications."
+    local_thr = CONF_THRESHOLD - (0.1 if (chunks and chunks[0][2].get("kind") == "sop") else 0.0)
+    reason = "ok"
+    if not chunks:
+        reason = "no_candidates"
+    elif top_score < SCORE_MIN or conf < local_thr:
+        reason = "low_conf"
 
-    prompt = user_prompt or "Compose a complete reply in the described style."
-    answer = ask_llm(prompt + "\n\nUser ticket:\n" + ticket_text, ctx, lang=lang, brand=brand)
+    assistant_prefill = make_assistant_prefill(platform, language=language)
+    prompt = user_prompt or "Compose a helpful, concise support reply in the same language as the user."
 
-    return answer + f"\n\n(confidence={conf:.2f}, top_score={top_score:.2f})"
+    answer = ask_llm(prompt + "\n\nUser ticket:\n" + ticket_text, ctx, assistant_prefill=assistant_prefill)
 
-def route_answer(question: str, *, version_hint: Optional[str]=None, platform: Optional[str]=None) -> str:
-    lang  = choose_language(question)
-    brand = choose_brand(question, BRAND_DEFAULT)
-
-    chunks = retrieve_base(question, version_hint=version_hint, platform=platform, limit=TOP_K)
-    ctx = build_context(chunks) if chunks else "No exact matches."
-    answer = ask_llm(question, ctx, lang=lang, brand=brand)
-
-    conf = confidence(chunks) if chunks else 0.0
-    top_score = chunks[0][0] if chunks else 0.0
-    return answer + f"\n\n(confidence={conf:.2f}, top_score={top_score:.2f})"
+    meta = {
+        "created_at": now_iso(),
+        "language": language,
+        "platform": platform,
+        "confidence": conf,
+        "top_score": top_score,
+        "reason": reason,
+        "chunks": chunks,
+    }
+    return answer, meta
